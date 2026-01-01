@@ -63,6 +63,7 @@
 
 import os 
 import sys
+import json
 from typing import Annotated
 from dotenv import load_dotenv
 
@@ -139,23 +140,45 @@ class AgentState(TypedDict):
  messages: Annotated[list[BaseMessage], add_messages]
 
 # def工具andLLM
+from langchain_core.tools import tool
+
+# 自定义工具，可以接受字符串参数并自动转换为字典
+@tool
+def web_search_tool(query: str) -> str:
+    """使用Tavily执行网络搜索并返回结果字符串。"""
+    console.print(f"--- TOOL: Searching for '{query}'...")
+    # 如果传入的是字符串，尝试解析为字典
+    if isinstance(query, str):
+        try:
+            # 尝试直接解析JSON
+            search_params = json.loads(query)
+            if isinstance(search_params, dict) and 'query' in search_params:
+                query = search_params['query']
+        except (json.JSONDecodeError, KeyError):
+            # 如果解析失败，保持原样
+            pass
+    
+    result = search_tool.invoke({"query": query})
+    return str(result)
+
+# 原始工具用于实际搜索
 search_tool = TavilySearchResults(max_results=2, name="web_search")
 llm = ChatOpenAI(model="Qwen/Qwen2.5-72B-Instruct", base_url=os.environ.get("OPENAI_API_BASE"), temperature=0)
-llm_with_tools = llm.bind_tools([search_tool])
+llm_with_tools = llm.bind_tools([web_search_tool])
 
 # def基础代理的代理节点
 def basic_agent_node(state: AgentState):
     console.print("--- 基本代理：思考中... ---")
-    # 注意：我们提供系统提示以鼓励它in一次工具调用后直接回答
-    system_prompt = "你is一个有帮助的助手。你可以访问网络搜索工具。根据工具结果回答用户的问题。你必须in一次工具调用后提供最终答案。"
-    messages= [("system", system_prompt)] + state["messages"]
-    response= llm_with_tools.invoke(messages)
+    # 注意：我们提供系统提示以鼓励它一次工具调用后直接回答
+    system_prompt = "你是一个有帮助的助手。你可以访问网络搜索工具。根据工具结果回答用户的问题。你必须在一次工具调用后提供最终答案。"
+    messages = [("system", system_prompt)] + state["messages"]
+    response = llm_with_tools.invoke(messages)
     return {"messages": [response]}
 
 # Define the basic, linear graph
 basic_graph_builder = StateGraph(AgentState)
 basic_graph_builder.add_node("agent", basic_agent_node)
-basic_graph_builder.add_node("tools", ToolNode([search_tool]))
+basic_graph_builder.add_node("tools", ToolNode([web_search_tool]))
 
 basic_graph_builder.set_entry_point("agent")
 # in代理之后，它只能转到工具；in工具之后，它必须结束。
@@ -276,11 +299,11 @@ console.print(Markdown(basic_agent_output['messages'][-1].content))
 
 def react_agent_node(state: AgentState):
     console.print("--- REACT代理：思考中... ---")
-    response= llm_with_tools.invoke(state["messages"])
+    response = llm_with_tools.invoke(state["messages"])
     return {"messages": [response]}
 
 # The ToolNode is the same as befor e
-react_tool_node = ToolNode([search_tool])
+react_tool_node = ToolNode([web_search_tool])
 
 # The router is also the same logic
 def react_router(state: AgentState):
@@ -404,21 +427,60 @@ class TaskEvaluation(BaseModel):
  推理质量评分: int = Field(description="对代理展示的逻辑流程and推理过程进行1-10评分。")
  理由: str = Field(description="评分的简要理由。")
 
-judge_llm = llm.with_structured_output(TaskEvaluation)
-
 def evaluate_agent_output(query: str, agent_output: dict):
- trace = "\n".join([f"{m.type}: {m.content}" for m in agent_output['messages']])
- prompt = f"""你is一名专业的AI代理评判员。in1-10的等级上评估以下代理in给定任务上的表现。10分表示任务完美完成。1分表示完全失败。
- 
- **用户的任务：**
- {query}
- 
- **完整的代理对话跟踪：**
- ```
- {trace}
- ```
- """
- return judge_llm.invoke(prompt)
+    trace = "\n".join([f"{m.type}: {m.content}" for m in agent_output['messages']])
+    prompt = f"""你是一名专业的AI代理评判员。请在1-10的等级上评估以下代理在给定任务上的表现。10分表示任务完美完成。1分表示完全失败。
+    
+    **用户的任务：**
+    {query}
+    
+    **完整的代理对话跟踪：**
+    ```
+    {trace}
+    ```
+    
+    请返回以下格式的评估结果：
+    任务完成评分: X
+    推理质量评分: Y
+    理由: Z
+    
+    其中X和Y是1-10的整数，Z是简要理由。"""
+    
+    response = llm.invoke(prompt)
+    
+    # 手动解析LLM响应
+    try:
+        lines = response.content.split('\n')
+        scores = {}
+        for line in lines:
+            if ':' in line:
+                key, value = line.split(':', 1)
+                key = key.strip()
+                value = value.strip()
+                
+                if '任务完成评分' in key:
+                    scores['任务完成评分'] = int(value)
+                elif '推理质量评分' in key:
+                    scores['推理质量评分'] = int(value)
+                elif '理由' in key:
+                    scores['理由'] = value
+        
+        # 如果解析失败，使用默认值
+        if len(scores) < 3:
+            scores = {
+                '任务完成评分': 5,
+                '推理质量评分': 5,
+                '理由': '解析失败，使用默认值'
+            }
+        
+        return TaskEvaluation(**scores)
+    except Exception as e:
+        # 如果解析失败，返回默认值
+        return TaskEvaluation(
+            任务完成评分=5,
+            推理质量评分=5,
+            理由=f'解析错误: {str(e)}'
+        )
 
 console.print("--- 评估基本代理的output ---")
 basic_agent_evaluation = evaluate_agent_output(multi_step_query, basic_agent_output)
